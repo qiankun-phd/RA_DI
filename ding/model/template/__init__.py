@@ -30,3 +30,4 @@ from .hpt import HPT
 from .qgpo import QGPO
 from .ebm import EBM, AutoregressiveEBM
 from .havac import HAVAC
+from .mavac_independent import MAVACIndependent

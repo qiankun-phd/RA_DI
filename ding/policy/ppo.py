@@ -378,7 +378,7 @@ class PPOPolicy(Policy):
                     'value_max': output['value'].max().item(),
                     'approx_kl': ppo_info.approx_kl,
                     'clipfrac': ppo_info.clipfrac,
-                    'kl_div': kl_div.item(),
+                    # 'kl_div': kl_div.item(),
                 }
                 if self._action_space == 'continuous':
                     return_info.update(

@@ -153,6 +153,43 @@ def rolloutor(
 
             env_info[timestep.env_id.item()]['time'] += timer.value + interaction_duration
             if timestep.done:
+                # Apply normalized rewards if available
+                if 'normalized_rewards' in timestep.info:
+                    normalized_rewards = timestep.info['normalized_rewards']
+                    # Get all transitions for this episode from the transitions list
+                    env_id = timestep.env_id.item()
+                    episode_transitions = transitions._transitions[env_id]
+                    done_indices = transitions._done_idx[env_id]
+                    
+                    # Find the start index of this episode
+                    # The last element in done_indices is the end of current episode
+                    if len(done_indices) > 1:
+                        # Current episode starts after the previous done_idx
+                        start_idx = done_indices[-2]
+                        end_idx = done_indices[-1]  # Current episode ends here
+                    else:
+                        # First episode for this env
+                        start_idx = 0
+                        end_idx = done_indices[0] if len(done_indices) > 0 else len(episode_transitions)
+                    
+                    # Replace rewards in transitions with normalized rewards
+                    episode_length = end_idx - start_idx
+                    if episode_length == len(normalized_rewards):
+                        for idx in range(episode_length):
+                            trans = episode_transitions[start_idx + idx]
+                            norm_reward = normalized_rewards[idx]
+                            # Convert normalized reward to appropriate format
+                            if isinstance(norm_reward, np.ndarray):
+                                norm_reward = norm_reward.item() if norm_reward.size == 1 else float(norm_reward)
+                            elif isinstance(norm_reward, (int, float)):
+                                norm_reward = float(norm_reward)
+                            # Replace reward in transition
+                            if hasattr(trans, 'reward'):
+                                trans.reward = ttorch.as_tensor([norm_reward])
+                            else:
+                                # If reward is stored differently, update accordingly
+                                trans['reward'] = ttorch.as_tensor([norm_reward])
+                
                 info = {
                     'reward': timestep.info['eval_episode_return'],
                     'time': env_info[timestep.env_id.item()]['time'],

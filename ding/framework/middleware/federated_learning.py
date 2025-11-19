@@ -5,6 +5,7 @@
 import torch
 import torch.nn as nn
 from typing import TYPE_CHECKING, Dict, List, Optional, Any
+from easydict import EasyDict
 from ditk import logging
 from ding.framework import task
 from time import sleep, time
@@ -12,6 +13,7 @@ from time import sleep, time
 if TYPE_CHECKING:
     from ding.framework.context import Context
     from torch.nn import Module
+    from ding.policy import Policy
 
 
 class FederatedAveraging:
@@ -21,39 +23,90 @@ class FederatedAveraging:
         支持每个agent有独立的网络参数，并定期对所有agent的参数进行平均。
     
     Arguments:
-        - agent_models (:obj:`List[torch.nn.Module]`): 每个agent的模型列表，长度为agent_num
-        - agent_num (:obj:`int`): agent数量
-        - aggregation_freq (:obj:`int`): 参数聚合频率，每N个训练步骤进行一次平均
-        - aggregation_mode (:obj:`str`): 聚合模式，'average'（简单平均）或 'weighted_average'（加权平均）
-        - agent_weights (:obj:`Optional[List[float]]`): 每个agent的权重（用于加权平均），如果为None则使用均匀权重
+        - cfg (:obj:`EasyDict`): 配置字典，包含以下字段：
+            - policy.model.agent_num: agent数量
+            - policy.federated_learning.aggregation_mode: 聚合模式，'average'（简单平均）或 'weighted_average'（加权平均），默认为 'average'
+            - policy.federated_learning.agent_weights: 每个agent的权重（用于加权平均），如果为None则使用均匀权重
+        - policy (:obj:`Policy`): 策略对象，其模型必须支持 `get_agent_models()` 方法（如MAVACIndependent）
+        - fl_freq (:obj:`int`): 参数聚合频率，每N个训练步骤进行一次平均，默认为0（从cfg中读取，如果cfg中没有则使用默认值10）
     """
     
     def __init__(
         self,
-        agent_models: List["Module"],
-        agent_num: int,
-        aggregation_freq: int = 10,
-        aggregation_mode: str = 'average',
-        agent_weights: Optional[List[float]] = None,
+        cfg: EasyDict,
+        policy: "Policy",
+        fl_freq: int = 0,
     ) -> None:
-        self._agent_models = agent_models
-        self._agent_num = agent_num
-        self._aggregation_freq = aggregation_freq
-        self._aggregation_mode = aggregation_mode
+        self.cfg = cfg
+        self.policy = policy
         self._step_count = 0
         
-        # 验证模型数量
-        if len(agent_models) != agent_num:
+        # 从policy中获取模型（优先使用_learn_model，如果没有则使用_model）
+        if hasattr(policy, '_learn_model') and policy._learn_model is not None:
+            model = policy._learn_model
+        elif hasattr(policy, '_model') and policy._model is not None:
+            model = policy._model
+        else:
+            raise ValueError("无法从policy中获取模型，请确保policy已正确初始化")
+        
+        # 检查模型是否支持get_agent_models方法
+        if not hasattr(model, 'get_agent_models'):
             raise ValueError(
-                f"模型数量 ({len(agent_models)}) 与agent数量 ({agent_num}) 不匹配"
+                "Model must implement `get_agent_models()`. "
+                "Please use a model with independent agent parameters (e.g., MAVACIndependent) instead of the shared-parameter MAPPO model."
             )
+        
+        # 获取所有agent的模型
+        self._agent_models = model.get_agent_models()
+        
+        # 从配置中获取agent数量
+        self._agent_num = cfg.policy.model.agent_num
+        
+        # 验证模型数量
+        if len(self._agent_models) != self._agent_num:
+            raise ValueError(
+                f"Number of agent models ({len(self._agent_models)}) does not match configured agent_num ({self._agent_num})."
+            )
+        
+        # 获取聚合频率（优先使用参数，其次从cfg读取，最后使用默认值）
+        if fl_freq > 0:
+            self._aggregation_freq = fl_freq
+        else:
+            # 从配置中读取，如果配置中没有则使用默认值10
+            fl_cfg = getattr(cfg.policy, 'federated_learning', None)
+            if fl_cfg and hasattr(fl_cfg, 'aggregation_freq'):
+                self._aggregation_freq = fl_cfg.aggregation_freq
+            elif isinstance(fl_cfg, dict) and 'aggregation_freq' in fl_cfg:
+                self._aggregation_freq = fl_cfg['aggregation_freq']
+            else:
+                self._aggregation_freq = 10
+        
+        # 从配置中获取聚合模式和权重
+        fl_cfg = getattr(cfg.policy, 'federated_learning', None)
+        if fl_cfg:
+            if hasattr(fl_cfg, 'aggregation_mode'):
+                self._aggregation_mode = fl_cfg.aggregation_mode
+            elif isinstance(fl_cfg, dict) and 'aggregation_mode' in fl_cfg:
+                self._aggregation_mode = fl_cfg['aggregation_mode']
+            else:
+                self._aggregation_mode = 'average'
+            
+            if hasattr(fl_cfg, 'agent_weights'):
+                agent_weights = fl_cfg.agent_weights
+            elif isinstance(fl_cfg, dict) and 'agent_weights' in fl_cfg:
+                agent_weights = fl_cfg['agent_weights']
+            else:
+                agent_weights = None
+        else:
+            self._aggregation_mode = 'average'
+            agent_weights = None
         
         # 设置权重
         if agent_weights is None:
-            self._agent_weights = [1.0 / agent_num] * agent_num
+            self._agent_weights = [1.0 / self._agent_num] * self._agent_num
         else:
-            if len(agent_weights) != agent_num:
-                raise ValueError(f"权重数量 ({len(agent_weights)}) 与agent数量 ({agent_num}) 不匹配")
+            if len(agent_weights) != self._agent_num:
+                raise ValueError(f"权重数量 ({len(agent_weights)}) 与agent数量 ({self._agent_num}) 不匹配")
             # 归一化权重
             total_weight = sum(agent_weights)
             self._agent_weights = [w / total_weight for w in agent_weights]
@@ -62,8 +115,8 @@ class FederatedAveraging:
         self._validate_model_structure()
         
         logging.info(
-            f"初始化联邦学习参数平均器: agent_num={agent_num}, "
-            f"aggregation_freq={aggregation_freq}, mode={aggregation_mode}"
+            f"Initialize federated averaging: agent_num={self._agent_num}, "
+            f"aggregation_freq={self._aggregation_freq}, mode={self._aggregation_mode}"
         )
     
     def _validate_model_structure(self):
@@ -75,11 +128,11 @@ class FederatedAveraging:
         for i, model in enumerate(self._agent_models[1:], 1):
             model_state_dict = model.state_dict()
             if set(reference_state_dict.keys()) != set(model_state_dict.keys()):
-                raise ValueError(f"Agent {i} 的模型结构与 Agent 0 不一致")
+                raise ValueError(f"Agent {i} model structure is inconsistent with agent 0.")
             for key in reference_state_dict.keys():
                 if reference_state_dict[key].shape != model_state_dict[key].shape:
                     raise ValueError(
-                        f"Agent {i} 的参数 {key} 的形状与 Agent 0 不一致: "
+                        f"Shape mismatch for parameter {key} between agent {i} and agent 0: "
                         f"{model_state_dict[key].shape} vs {reference_state_dict[key].shape}"
                     )
     
@@ -93,7 +146,7 @@ class FederatedAveraging:
         elif self._aggregation_mode == 'weighted_average':
             self._weighted_average()
         else:
-            raise ValueError(f"不支持的聚合模式: {self._aggregation_mode}")
+            raise ValueError(f"Unsupported aggregation mode: {self._aggregation_mode}")
     
     def _simple_average(self):
         """简单平均：所有agent参数的平均值"""
@@ -150,7 +203,7 @@ class FederatedAveraging:
                     if key in averaged_params:
                         param.data.copy_(averaged_params[key])
         
-        logging.info(f"完成参数平均聚合 (简单平均模式)")
+        logging.info("Federated averaging done (simple average).")
     
     def _weighted_average(self):
         """加权平均：根据权重对agent参数进行加权平均"""
@@ -197,7 +250,7 @@ class FederatedAveraging:
                     if key in averaged_params:
                         param.data.copy_(averaged_params[key])
         
-        logging.info(f"完成参数平均聚合 (加权平均模式, 权重={self._agent_weights})")
+        logging.info(f"Federated averaging done (weighted average, weights={self._agent_weights}).")
     
     def __call__(self, ctx: "Context") -> Any:
         """
@@ -205,77 +258,20 @@ class FederatedAveraging:
             中间件调用函数，在每个训练步骤后检查是否需要聚合参数
         """
         self._step_count += 1
-        
+
+        # 优先使用 ctx.train_iter 作为日志和触发参考，以便与训练迭代保持一致
+        current_iter = getattr(ctx, "train_iter", None)
+        counter_for_trigger = current_iter if current_iter is not None else self._step_count
+        log_prefix = (
+            f"Train iter {current_iter}"
+            if current_iter is not None else
+            f"Step {self._step_count}"
+        )
+
         # 检查是否到达聚合频率
-        if self._step_count % self._aggregation_freq == 0:
-            logging.info(f"步骤 {self._step_count}: 开始参数聚合...")
+        if counter_for_trigger % self._aggregation_freq == 0:
+            logging.info(f"{log_prefix}: start federated averaging.")
             self._average_parameters()
-            logging.info(f"步骤 {self._step_count}: 参数聚合完成")
+            logging.info(f"{log_prefix}: federated averaging finished.")
         
         yield
-
-
-class MultiAgentFederatedAveraging:
-    """
-    Overview:
-        多智能体联邦学习参数平均中间件（适用于MAPPO场景）。
-        从单个MAVAC模型中提取每个agent的参数并进行平均。
-        
-    Note:
-        这个版本假设使用共享参数的MAVAC模型，但可以通过hook机制实现每个agent的参数分离和平均。
-        如果需要完全独立的agent网络，需要修改MAVAC模型结构。
-    
-    Arguments:
-        - model (:obj:`torch.nn.Module`): 多智能体模型（如MAVAC）
-        - agent_num (:obj:`int`): agent数量
-        - aggregation_freq (:obj:`int`): 参数聚合频率
-        - use_actor_only (:obj:`bool`): 是否只对actor网络进行平均（默认False，对actor和critic都平均）
-    """
-    
-    def __init__(
-        self,
-        model: "Module",
-        agent_num: int,
-        aggregation_freq: int = 10,
-        use_actor_only: bool = False,
-    ) -> None:
-        self._model = model
-        self._agent_num = agent_num
-        self._aggregation_freq = aggregation_freq
-        self._use_actor_only = use_actor_only
-        self._step_count = 0
-        
-        # 检查模型是否支持多智能体
-        if not hasattr(model, 'actor') or not hasattr(model, 'critic'):
-            raise ValueError("模型必须包含 'actor' 和 'critic' 属性（如MAVAC模型）")
-        
-        logging.info(
-            f"初始化多智能体联邦学习参数平均器: agent_num={agent_num}, "
-            f"aggregation_freq={aggregation_freq}, use_actor_only={use_actor_only}"
-        )
-    
-    def _average_parameters(self):
-        """
-        Overview:
-            对模型参数进行平均（在MAPPO中，所有agent共享参数，这里主要是占位）
-        
-        Note:
-            在标准的MAPPO实现中，所有agent共享同一套参数，所以不需要平均。
-            如果需要实现真正的联邦学习，需要：
-            1. 修改MAVAC模型，为每个agent创建独立的网络
-            2. 或者在训练过程中为每个agent维护独立的参数副本
-        """
-        # 在标准MAPPO中，参数是共享的，所以这里只是记录日志
-        # 如果需要真正的联邦学习，需要修改模型结构
-        logging.warning(
-            "标准MAPPO使用参数共享，无法进行参数平均。"
-            "如需实现联邦学习，请使用独立agent网络的模型结构。"
-        )
-    
-    def __call__(self, ctx: "Context") -> Any:
-        """中间件调用函数"""
-        self._step_count += 1
-        if self._step_count % self._aggregation_freq == 0:
-            self._average_parameters()
-        yield
-
