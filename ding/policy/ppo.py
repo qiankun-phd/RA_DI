@@ -155,12 +155,28 @@ class PPOPolicy(Policy):
                     torch.nn.init.zeros_(m.bias)
             if self._action_space in ['continuous', 'hybrid']:
                 # init log sigma
-                if self._action_space == 'continuous':
-                    if hasattr(self._model.actor_head, 'log_sigma_param'):
-                        torch.nn.init.constant_(self._model.actor_head.log_sigma_param, -0.5)
-                elif self._action_space == 'hybrid':  # actor_head[1]: ReparameterizationHead, for action_args
-                    if hasattr(self._model.actor_head[1], 'log_sigma_param'):
-                        torch.nn.init.constant_(self._model.actor_head[1].log_sigma_param, -0.5)
+                # 检查是否是MAVACIndependent（有get_agent_models方法），如果是则初始化所有agent
+                if hasattr(self._model, 'get_agent_models'):
+                    # MAVACIndependent: 初始化所有agent的log_sigma_param
+                    agent_models = self._model.get_agent_models()
+                    if self._action_space == 'continuous':
+                        for agent_model in agent_models:
+                            actor_head = agent_model['actor'][1]  # actor_head是ModuleList的第二个元素
+                            if hasattr(actor_head, 'log_sigma_param'):
+                                torch.nn.init.constant_(actor_head.log_sigma_param, -0.5)
+                    elif self._action_space == 'hybrid':  # actor_head[1]: ReparameterizationHead, for action_args
+                        for agent_model in agent_models:
+                            actor_head = agent_model['actor'][1]
+                            if hasattr(actor_head[1], 'log_sigma_param'):
+                                torch.nn.init.constant_(actor_head[1].log_sigma_param, -0.5)
+                else:
+                    # 标准MAVAC或其他模型：只初始化第一个（共享参数）
+                    if self._action_space == 'continuous':
+                        if hasattr(self._model.actor_head, 'log_sigma_param'):
+                            torch.nn.init.constant_(self._model.actor_head.log_sigma_param, -0.5)
+                    elif self._action_space == 'hybrid':  # actor_head[1]: ReparameterizationHead, for action_args
+                        if hasattr(self._model.actor_head[1], 'log_sigma_param'):
+                            torch.nn.init.constant_(self._model.actor_head[1].log_sigma_param, -0.5)
 
                 for m in list(self._model.critic.modules()) + list(self._model.actor.modules()):
                     if isinstance(m, torch.nn.Linear):
@@ -325,18 +341,30 @@ class PPOPolicy(Policy):
                     )
                     ppo_loss, ppo_info = ppo_error(ppo_batch, self._clip_ratio, kl_type=self._kl_type)
                 elif self._action_space == 'hybrid':
+                    # Get logit_pretrained for hybrid action space
+                    if self._pretrained_model is not None and logit_pretrained is not None:
+                        # Extract action_type from pretrained logit for hybrid
+                        logit_pretrained_action_type = logit_pretrained.get('action_type', None) if isinstance(logit_pretrained, dict) else None
+                    else:
+                        logit_pretrained_action_type = None
+                    
                     # discrete part (discrete policy loss and entropy loss)
                     ppo_discrete_batch = ppo_policy_data(
                         output['logit']['action_type'], batch['logit']['action_type'], batch['action']['action_type'],
-                        adv, batch['weight']
+                        adv, batch['weight'], logit_pretrained_action_type
                     )
                     ppo_discrete_loss, ppo_discrete_info = ppo_policy_error(
                         ppo_discrete_batch, self._clip_ratio, kl_type=self._kl_type
                     )
                     # continuous part (continuous policy loss and entropy loss, value loss)
+                    # For continuous part, logit_pretrained should be action_args if available
+                    if self._pretrained_model is not None and logit_pretrained is not None:
+                        logit_pretrained_action_args = logit_pretrained.get('action_args', None) if isinstance(logit_pretrained, dict) else None
+                    else:
+                        logit_pretrained_action_args = None
                     ppo_continuous_batch = ppo_data(
                         output['logit']['action_args'], batch['logit']['action_args'], batch['action']['action_args'],
-                        output['value'], batch['value'], adv, batch['return'], batch['weight']
+                        output['value'], batch['value'], adv, batch['return'], batch['weight'], logit_pretrained_action_args
                     )
                     ppo_continuous_loss, ppo_continuous_info = ppo_error_continuous(
                         ppo_continuous_batch, self._clip_ratio, kl_type=self._kl_type
@@ -1132,12 +1160,28 @@ class PPOOffPolicy(Policy):
                     torch.nn.init.zeros_(m.bias)
             if self._action_space in ['continuous', 'hybrid']:
                 # init log sigma
-                if self._action_space == 'continuous':
-                    if hasattr(self._model.actor_head, 'log_sigma_param'):
-                        torch.nn.init.constant_(self._model.actor_head.log_sigma_param, -2.0)
-                elif self._action_space == 'hybrid':  # actor_head[1]: ReparameterizationHead, for action_args
-                    if hasattr(self._model.actor_head[1], 'log_sigma_param'):
-                        torch.nn.init.constant_(self._model.actor_head[1].log_sigma_param, -0.5)
+                # 检查是否是MAVACIndependent（有get_agent_models方法），如果是则初始化所有agent
+                if hasattr(self._model, 'get_agent_models'):
+                    # MAVACIndependent: 初始化所有agent的log_sigma_param
+                    agent_models = self._model.get_agent_models()
+                    if self._action_space == 'continuous':
+                        for agent_model in agent_models:
+                            actor_head = agent_model['actor'][1]  # actor_head是ModuleList的第二个元素
+                            if hasattr(actor_head, 'log_sigma_param'):
+                                torch.nn.init.constant_(actor_head.log_sigma_param, -2.0)
+                    elif self._action_space == 'hybrid':  # actor_head[1]: ReparameterizationHead, for action_args
+                        for agent_model in agent_models:
+                            actor_head = agent_model['actor'][1]
+                            if hasattr(actor_head[1], 'log_sigma_param'):
+                                torch.nn.init.constant_(actor_head[1].log_sigma_param, -0.5)
+                else:
+                    # 标准MAVAC或其他模型：只初始化第一个（共享参数）
+                    if self._action_space == 'continuous':
+                        if hasattr(self._model.actor_head, 'log_sigma_param'):
+                            torch.nn.init.constant_(self._model.actor_head.log_sigma_param, -2.0)
+                    elif self._action_space == 'hybrid':  # actor_head[1]: ReparameterizationHead, for action_args
+                        if hasattr(self._model.actor_head[1], 'log_sigma_param'):
+                            torch.nn.init.constant_(self._model.actor_head[1].log_sigma_param, -0.5)
 
                 for m in list(self._model.critic.modules()) + list(self._model.actor.modules()):
                     if isinstance(m, torch.nn.Linear):

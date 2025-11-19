@@ -290,37 +290,67 @@ class MultiGeneralEnv(BaseEnv):
         self._step_counter = 0
         self._cumulative_success = np.zeros(self._n_user, dtype=np.float32)
         self._episode_rewards = []  # Store rewards for the current episode
+        self._eval_episode_return = 0.0  # Track cumulative reward for evaluator
         self._normalize_reward = self._cfg.get('normalize_reward', False)
-
-        # Calculate state dimension based on the new get_state logic
-        # cellular_fast (n_rb) + cellular_abs (n_rb) + channel_choice (n_rb) + user_vector (n_rb) + success (1) + time (1)
-        state_dim = self._n_rb * 4 + 2
+        self._init_flag = False  # Flag to track if observation_space has been initialized
         
-        obs_low = -np.inf * np.ones((self._n_user, state_dim), dtype=np.float32)
-        obs_high = np.inf * np.ones((self._n_user, state_dim), dtype=np.float32)
-        self._observation_space = gym.spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
-        low_vec = np.array([0, float(min(self._env.cellular_power_db_list))], dtype=np.float32)
-        high_vec = np.array([
-            float(self._n_rb - 1), float(max(self._env.cellular_power_db_list))
-        ], dtype=np.float32)
-        # per-agent action space (Dict), each agent acts with [rb_idx, power_db]
-        single_agent_box = gym.spaces.Box(low=low_vec, high=high_vec, dtype=np.float32)
-        self._action_space = gym.spaces.Dict({agent: single_agent_box for agent in self._agents})
+        # Action space and reward space can be set immediately
+        # Hybrid action space: discrete (rb selection) + continuous (power)
+        # action_type: Discrete(n_rb) - 选择资源块 (0 到 n_rb-1)
+        # action_args: Box - 选择功率 (连续值)
+        action_type_space = gym.spaces.Discrete(self._n_rb)
+        action_args_low = np.array([float(min(self._env.cellular_power_db_list))], dtype=np.float32)
+        action_args_high = np.array([float(max(self._env.cellular_power_db_list))], dtype=np.float32)
+        action_args_space = gym.spaces.Box(low=action_args_low, high=action_args_high, dtype=np.float32)
+        
+        # Hybrid action space for each agent
+        single_agent_hybrid = gym.spaces.Dict({
+            'action_type': action_type_space,
+            'action_args': action_args_space
+        })
+        self._action_space = gym.spaces.Dict({agent: single_agent_hybrid for agent in self._agents})
         self._reward_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32)
+        
+        # observation_space will be initialized in reset() method (lazy initialization, like petting_zoo)
+        # Don't set _observation_space here - let it raise AttributeError when accessed, 
+        # so BaseEnvManager's try-except will catch it and call reset()
 
-    def reset(self) -> np.ndarray:
+    def reset(self) -> Union[np.ndarray, dict]:
+        # Initialize observation_space on first reset (lazy initialization, like petting_zoo)
+        if not self._init_flag:
+            # Calculate state dimension based on the new get_state logic
+            # cellular_fast (n_rb) + cellular_abs (n_rb) + channel_choice (n_rb) + user_vector (n_rb) + success (1) + time (1)
+            state_dim = self._n_rb * 4 + 2
+            
+            obs_low = -np.inf * np.ones((self._n_user, state_dim), dtype=np.float32)
+            obs_high = np.inf * np.ones((self._n_user, state_dim), dtype=np.float32)
+            
+            # Define observation space - only agent_state, no global_state
+            if self._agent_obs_only:
+                self._observation_space = gym.spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
+            else:
+                # Dict format with only agent_state (each agent has different state)
+                self._observation_space = gym.spaces.Dict({
+                    'agent_state': gym.spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
+                })
+            self._init_flag = True
+        
         self._step_counter = 0
         self._env.new_random_game(self._n_user)
         self._cumulative_success.fill(0)  # Reset cumulative success at the beginning of each episode
         self._episode_rewards = []  # Reset episode rewards
+        self._eval_episode_return = 0.0  # Reset episode return for evaluator
         return self._get_obs()
 
-    def step(self, action: np.ndarray) -> BaseEnvTimestep:
+    def step(self, action: Union[np.ndarray, dict]) -> BaseEnvTimestep:
         self._step_counter += 1
-        # process action (support ndarray or dict like PettingZoo)
+        # process action (support ndarray, dict, or hybrid action format)
         action_arr = self._process_action(action)
         reward = self._env.act_for_training(action_arr, is_ppo=True)
         self._cumulative_success += self._env.success
+        
+        # Track cumulative reward for evaluator
+        self._eval_episode_return += reward
         
         # Store reward for normalization
         self._episode_rewards.append(reward)
@@ -337,11 +367,21 @@ class MultiGeneralEnv(BaseEnv):
             # Use the normalized reward for the current step
             reward = normalized_rewards[-1]
             # Store normalized rewards in info for reference
-            info = self._collect_info(action_arr)
-            info['normalized_rewards'] = normalized_rewards
-            info['raw_rewards'] = rewards_array
+            episode_info = self._collect_info(action_arr)
+            episode_info['normalized_rewards'] = normalized_rewards
+            episode_info['raw_rewards'] = rewards_array
         else:
-            info = self._collect_info(action_arr)
+            episode_info = self._collect_info(action_arr)
+        
+        # Add eval_episode_return to info when episode is done (required by evaluator)
+        # Divide by n_user to get per-agent return
+        if done:
+            info = {
+                'eval_episode_return': self._eval_episode_return / (self._n_user*self._max_episode_steps),
+                'episode_info': episode_info
+            }
+        else:
+            info = {}
 
         # update environment for next state
         self._env.renew_positions()
@@ -361,9 +401,11 @@ class MultiGeneralEnv(BaseEnv):
             'success_rate_per_user': success_rate_per_user
         }
 
-    def _get_obs(self) -> np.ndarray:
+    def _get_obs(self) -> Union[np.ndarray, dict]:
         """
         Get state from the environment for each agent, based on the user-provided logic.
+        Returns dict with 'agent_state' and 'global_state' when agent_obs_only=False,
+        otherwise returns array.
         """
         n_user = self._n_user
         n_rb = self._n_rb
@@ -396,27 +438,71 @@ class MultiGeneralEnv(BaseEnv):
             
         obs = np.stack(agent_states).astype(np.float32)
         
-        if self._agent_obs_only:
-            # In this setup, agent_obs is the same as the global stacked state
-            return obs
-        return obs
+        # Return only agent_state (each agent has its own different state)
+        # No global_state needed - each agent uses its own state for both actor and critic
+        return {'agent_state': obs}
 
     def _process_action(self, action: Union[np.ndarray, dict]) -> np.ndarray:
-        """Convert per-agent dict action or ndarray into (n_user, 2) float32 array and clip to valid range."""
         n = self._n_user
         low = np.array([0, float(min(self._env.cellular_power_db_list))], dtype=np.float32)
         high = np.array([float(self._n_rb - 1), float(max(self._env.cellular_power_db_list))], dtype=np.float32)
+        
+        arr = np.zeros((n, 2), dtype=np.float32)
+        
         if isinstance(action, dict):
-            arr = np.zeros((n, 2), dtype=np.float32)
-            for i, agent in enumerate(self._agents):
-                arr[i] = np.array(action[agent], dtype=np.float32)
+            # 检查是否是hybrid action格式
+            if 'action_type' in action and 'action_args' in action:
+                # Hybrid action format: {'action_type': (n_user,), 'action_args': (n_user, 1)}
+                action_type = action['action_type']
+                action_args = action['action_args']
+                
+                # 转换为numpy数组
+                if hasattr(action_type, 'cpu'):
+                    action_type = action_type.cpu().numpy()
+                if hasattr(action_args, 'cpu'):
+                    action_args = action_args.cpu().numpy()
+                
+                # 处理形状
+                if action_type.ndim > 1:
+                    action_type = action_type.squeeze()
+                if action_args.ndim > 1:
+                    action_args = action_args.squeeze()
+        
+                
+                arr[:, 0] = action_type.astype(np.float32)  # rb_idx (discrete -> float for compatibility)
+                action_bound = 1.0  # tanh bound, action_args range is [-1, 1]
+                max_power = float(self._env.cellular_power_db_list[0])  # 24
+                amp = max_power / (2 * action_bound)  # 24 / 2 = 12
+                power_action = (action_args + action_bound) * amp  # Map from [-1, 1] to [0, 24]
+                arr[:, 1] = power_action.astype(np.float32)  # power_db
+            else:
+                # Per-agent dict format (like PettingZoo)
+                for i, agent in enumerate(self._agents):
+                    if agent in action:
+                        agent_action = action[agent]
+                        if isinstance(agent_action, dict) and 'action_type' in agent_action and 'action_args' in agent_action:
+                            # Per-agent hybrid action
+                            arr[i, 0] = float(agent_action['action_type'])
+                            # Map action_args (power) from model output range to actual power range
+                            action_bound = 1.0  # tanh bound
+                            max_power = float(self._env.cellular_power_db_list[0])  # 24
+                            amp = max_power / (2 * action_bound)  # 24 / 2 = 12
+                            power_action = (float(agent_action['action_args']) + action_bound) * amp
+                            arr[i, 1] = float(power_action)
+                        else:
+                            arr[i] = np.array(agent_action, dtype=np.float32)
         else:
+            # ndarray format
             arr = np.asarray(action, dtype=np.float32)
-            if arr.shape != (n, 2):
-                raise ValueError(f'action shape should be ({n}, 2), got {arr.shape}')
+            if arr.shape == (n,):
+                # 如果只有一维，假设是rb_idx，需要补充power
+                arr = np.column_stack([arr, np.zeros(n, dtype=np.float32)])
+            elif arr.shape != (n, 2):
+                raise ValueError(f'action shape should be ({n}, 2) or ({n},), got {arr.shape}')
+        
         # clip per-dimension
-        arr[:, 0] = np.clip(arr[:, 0], low[0], high[0])
-        arr[:, 1] = np.clip(arr[:, 1], low[1], high[1])
+        arr[:, 0] = np.clip(arr[:, 0], low[0], high[0])  # rb_idx: 0 to n_rb-1
+        arr[:, 1] = np.clip(arr[:, 1], low[1], high[1])  # power_db
         return arr
 
     def close(self) -> None:

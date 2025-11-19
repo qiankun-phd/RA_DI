@@ -96,7 +96,9 @@ def multistep_trainer(policy: Policy, log_freq: int = 100) -> Callable:
                     'Training: Train Iter({})\tEnv Step({})\tLoss({:.3f})'.format(ctx.train_iter, ctx.env_step, loss)
                 )
             last_log_iter = ctx.train_iter
-        ctx.train_iter += len(train_output)
+        # train_iter represents the number of collect+train cycles, not total epochs
+        # Each cycle trains epoch_per_collect epochs, but train_iter increments by 1
+        ctx.train_iter += 1
         ctx.train_output = train_output
 
     return _train

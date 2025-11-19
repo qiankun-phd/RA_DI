@@ -152,7 +152,9 @@ class VectorEvalMonitor(object):
                     if np.isscalar(total_info[k][0].item()):
                         new_dict[k + '_mean'] = np.mean(total_info[k])
                 except:  # noqa
-                    pass
+                    # For non-scalar values (like arrays), include them directly
+                    # This allows access to success_rate_per_user and other array-based metrics
+                    new_dict[k] = total_info[k]
             return new_dict
 
     def _select_idx(self):
@@ -284,10 +286,31 @@ def interaction_evaluator(
         episode_return_std = np.std(episode_return)
         episode_return = np.mean(episode_return)
         stop_flag = episode_return >= cfg.env.stop_value and ctx.train_iter > 0
+        
+        # Extract success rate per user from episode_info (only for environments that provide it)
+        success_rate_str = ""
+        try:
+            episode_info = eval_monitor.get_episode_info()
+            if episode_info is not None and isinstance(episode_info, dict) and 'success_rate_per_user' in episode_info:
+                success_rates_list = episode_info['success_rate_per_user']
+                # success_rates_list is a list of arrays (one per episode)
+                if isinstance(success_rates_list, list) and len(success_rates_list) > 0:
+                    # Convert to numpy array and compute mean across episodes
+                    success_rates_array = np.array(success_rates_list)  # shape: (n_episodes, n_users)
+                    if success_rates_array.ndim == 2:  # Ensure it's 2D array
+                        success_rates_mean = np.mean(success_rates_array, axis=0)  # shape: (n_users,)
+                        # Format: "UE0: 0.95, UE1: 0.92, ..."
+                        success_rate_str = " | Success Rate: " + ", ".join(
+                            [f"UE{i}: {rate:.3f}" for i, rate in enumerate(success_rates_mean)]
+                        )
+        except Exception:
+            # Silently ignore errors to avoid affecting other environments
+            pass
+        
         if isinstance(ctx, OnlineRLContext):
             logging.info(
-                'Evaluation: Train Iter({}) Env Step({}) Episode Return({:.3f}) {}'.format(
-                    ctx.train_iter, ctx.env_step, episode_return, kwargs_str
+                'Evaluation: Train Iter({}) Env Step({}) Episode Return({:.3f}) {}{}'.format(
+                    ctx.train_iter, ctx.env_step, episode_return, kwargs_str, success_rate_str
                 )
             )
         elif isinstance(ctx, OfflineRLContext):
@@ -398,9 +421,30 @@ def interaction_evaluator_ttorch(
         episode_return_std = np.std(episode_return)
         episode_return_mean = np.mean(episode_return)
         stop_flag = episode_return_mean >= stop_value and ctx.train_iter > 0
+        
+        # Extract success rate per user from episode_info (only for environments that provide it)
+        success_rate_str = ""
+        try:
+            episode_info = eval_monitor.get_episode_info()
+            if episode_info is not None and isinstance(episode_info, dict) and 'success_rate_per_user' in episode_info:
+                success_rates_list = episode_info['success_rate_per_user']
+                # success_rates_list is a list of arrays (one per episode)
+                if isinstance(success_rates_list, list) and len(success_rates_list) > 0:
+                    # Convert to numpy array and compute mean across episodes
+                    success_rates_array = np.array(success_rates_list)  # shape: (n_episodes, n_users)
+                    if success_rates_array.ndim == 2:  # Ensure it's 2D array
+                        success_rates_mean = np.mean(success_rates_array, axis=0)  # shape: (n_users,)
+                        # Format: "UE0: 0.95, UE1: 0.92, ..."
+                        success_rate_str = " | Success Rate: " + ", ".join(
+                            [f"UE{i}: {rate:.3f}" for i, rate in enumerate(success_rates_mean)]
+                        )
+        except Exception:
+            # Silently ignore errors to avoid affecting other environments
+            pass
+        
         logging.info(
-            'Evaluation: Train Iter({})\tEnv Step({})\tMean Episode Return({:.3f})'.format(
-                ctx.train_iter, ctx.env_step, episode_return_mean
+            'Evaluation: Train Iter({})\tEnv Step({})\tMean Episode Return({:.3f}){}'.format(
+                ctx.train_iter, ctx.env_step, episode_return_mean, success_rate_str
             )
         )
         ctx.last_eval_iter = ctx.train_iter

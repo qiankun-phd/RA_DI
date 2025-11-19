@@ -5,9 +5,12 @@
 from typing import Union, Dict, Tuple, Optional
 import torch
 import torch.nn as nn
+from easydict import EasyDict
 
 from ding.utils import SequenceType, squeeze, MODEL_REGISTRY
-from ..common import ReparameterizationHead, RegressionHead, DiscreteHead
+from ..common import ReparameterizationHead, RegressionHead, DiscreteHead, FCEncoder
+from ding.torch_utils.network import fc_block
+from ding.torch_utils.network.normalization import build_normalization
 
 
 @MODEL_REGISTRY.register('mavac_independent')
@@ -39,6 +42,7 @@ class MAVACIndependent(nn.Module):
         sigma_type: Optional[str] = 'independent',
         bound_type: Optional[str] = None,
         encoder: Optional[Tuple[torch.nn.Module, torch.nn.Module]] = None,
+        encoder_hidden_size_list: Optional[SequenceType] = None,  # For 3-layer shared encoder (512->256->128)
     ) -> None:
         """
         Overview:
@@ -53,8 +57,24 @@ class MAVACIndependent(nn.Module):
         """
         super(MAVACIndependent, self).__init__()
         agent_obs_shape: int = squeeze(agent_obs_shape)
-        global_obs_shape: int = squeeze(global_obs_shape)
-        action_shape: int = squeeze(action_shape)
+        # For FL scenario without global_state, critic also uses agent_state
+        # So global_obs_shape should equal agent_obs_shape
+        if global_obs_shape is None or global_obs_shape == 0:
+            global_obs_shape = agent_obs_shape
+        else:
+            global_obs_shape: int = squeeze(global_obs_shape)
+        
+        # 处理hybrid action space的action_shape
+        if action_space == 'hybrid':
+            if isinstance(action_shape, (dict, EasyDict)):
+                action_shape = EasyDict(action_shape)
+            else:
+                raise ValueError("For hybrid action_space, action_shape must be EasyDict with 'action_type_shape' and 'action_args_shape'")
+            action_shape.action_args_shape = squeeze(action_shape.action_args_shape)
+            action_shape.action_type_shape = squeeze(action_shape.action_type_shape)
+        else:
+            action_shape: int = squeeze(action_shape)
+        
         self.global_obs_shape = global_obs_shape
         self.agent_obs_shape = agent_obs_shape
         self.action_shape = action_shape
@@ -64,6 +84,35 @@ class MAVACIndependent(nn.Module):
         # 为每个agent创建独立的网络
         self.agent_models = nn.ModuleList()
         
+        # 创建encoder的辅助函数（参考vac.py的实现，支持BatchNorm）
+        def new_encoder(hidden_size_list, activation, norm_type):
+            if hidden_size_list:
+                # 如果指定了norm_type，手动创建带BatchNorm的encoder（匹配TensorFlow实现）
+                if norm_type and norm_type.upper() in ['BN', 'BATCHNORM']:
+                    layers = []
+                    # 第一层: obs -> hidden_size_list[0]
+                    layers.append(fc_block(
+                        agent_obs_shape, hidden_size_list[0],
+                        activation=activation, norm_type='BN'  # fc_block会根据dim=1自动构建BN1
+                    ))
+                    # 后续层
+                    for i in range(len(hidden_size_list) - 1):
+                        layers.append(fc_block(
+                            hidden_size_list[i], hidden_size_list[i + 1],
+                            activation=activation, norm_type='BN'  # fc_block会根据dim=1自动构建BN1
+                        ))
+                    return nn.Sequential(*layers)
+                else:
+                    # 使用FCEncoder创建多层结构（不带BatchNorm）
+                    return FCEncoder(
+                        obs_shape=agent_obs_shape,
+                        hidden_size_list=hidden_size_list,
+                        activation=activation,
+                        norm_type=norm_type
+                    )
+            else:
+                return None
+        
         for agent_id in range(agent_num):
             # 为每个agent创建独立的encoder和head
             if encoder:
@@ -72,18 +121,41 @@ class MAVACIndependent(nn.Module):
                 actor_enc = self._clone_module(actor_encoder)
                 critic_enc = self._clone_module(critic_encoder)
             else:
-                actor_enc = nn.Sequential(
-                    nn.Linear(agent_obs_shape, actor_head_hidden_size),
-                    activation,
-                )
-                critic_enc = nn.Sequential(
-                    nn.Linear(global_obs_shape, critic_head_hidden_size),
-                    activation,
-                )
+                if encoder_hidden_size_list:
+                    # 共享编码器：obs -> 512 -> 256 (前两层)
+                    # Actor分支：从256维输出 (mu, sigma, RB)
+                    # Critic分支：256 -> 128 -> v (在RegressionHead中处理)
+                    shared_hidden_list = encoder_hidden_size_list[:2]  # [512, 256]
+                    shared_encoder = new_encoder(shared_hidden_list, activation, norm_type)
+                    
+                    # Actor encoder: 直接使用共享编码器（到256维）
+                    actor_enc = shared_encoder
+                    
+                    # Critic encoder: 也使用共享编码器（到256维），256->128在RegressionHead中处理
+                    critic_enc = shared_encoder
+                else:
+                    # 默认单层结构（不共享）
+                    actor_enc = nn.Sequential(
+                        nn.Linear(agent_obs_shape, actor_head_hidden_size),
+                        activation,
+                    )
+                    # Critic uses agent_state instead of global_state (same shape as actor)
+                    critic_enc = nn.Sequential(
+                        nn.Linear(agent_obs_shape, critic_head_hidden_size),
+                        activation,
+                    )
             
             # 创建head
+            # Critic head: 如果使用共享编码器，输入256维，通过hidden_size=128添加256->128层
+            if encoder_hidden_size_list:
+                critic_head_input_size = encoder_hidden_size_list[1]  # 256
+                critic_head_hidden_size_param = encoder_hidden_size_list[2]  # 128
+            else:
+                critic_head_input_size = critic_head_hidden_size
+                critic_head_hidden_size_param = critic_head_hidden_size
             critic_head = RegressionHead(
-                critic_head_hidden_size, 1, critic_head_layer_num, 
+                critic_head_input_size, 1, critic_head_layer_num,
+                hidden_size=critic_head_hidden_size_param,  # 256 -> 128 -> 1
                 activation=activation, norm_type=norm_type
             )
             
@@ -102,6 +174,28 @@ class MAVACIndependent(nn.Module):
                     norm_type=norm_type,
                     bound_type=bound_type
                 )
+            elif action_space == 'hybrid':
+                # hybrid action space: action_type(discrete) + action_args(continuous)
+                # action_type: 选择rb (0 到 n_rb-1)
+                # action_args: 选择功率 (连续值)
+                actor_action_type = DiscreteHead(
+                    actor_head_hidden_size,
+                    action_shape.action_type_shape,
+                    actor_head_layer_num,
+                    activation=activation,
+                    norm_type=norm_type,
+                )
+                actor_action_args = ReparameterizationHead(
+                    actor_head_hidden_size,
+                    action_shape.action_args_shape,
+                    actor_head_layer_num,
+                    sigma_type=sigma_type,
+                    activation=activation,
+                    norm_type=norm_type,
+                    bound_type=bound_type,
+                    hidden_size=actor_head_hidden_size,
+                )
+                actor_head = nn.ModuleList([actor_action_type, actor_action_args])
             else:
                 raise ValueError(f"不支持的动作空间: {action_space}")
             
@@ -143,53 +237,85 @@ class MAVACIndependent(nn.Module):
     def compute_actor(self, x: Dict) -> Dict:
         """计算actor输出，每个agent使用自己的网络"""
         agent_state = x['agent_state']  # shape: (B, M, obs_dim)
-        batch_size = agent_state.shape[0]
+        action_mask = x.get('action_mask', None)
         
+        # 为每个agent分别计算（由于参数独立，必须循环处理）
         if self.action_space == 'discrete':
-            action_mask = x.get('action_mask', None)
-        
-        # 为每个agent分别计算
-        logits = []
-        for agent_id in range(self.agent_num):
-            agent_obs = agent_state[:, agent_id, :]  # (B, obs_dim)
-            agent_model = self.agent_models[agent_id]
-            
-            # 通过actor encoder和head
-            x_enc = agent_model['actor'][0](agent_obs)
-            x_head = agent_model['actor'][1](x_enc)
-            
-            if self.action_space == 'discrete':
+            logits = []
+            for agent_id in range(self.agent_num):
+                agent_obs = agent_state[:, agent_id, :]  # (B, obs_dim)
+                agent_model = self.agent_models[agent_id]
+                x_enc = agent_model['actor'][0](agent_obs)
+                x_head = agent_model['actor'][1](x_enc)
                 logit = x_head['logit']  # (B, action_dim)
                 if action_mask is not None:
-                    mask = action_mask[:, agent_id, :]  # (B, action_dim)
-                    logit[mask == 0.0] = -99999999
+                    logit[action_mask[:, agent_id, :] == 0.0] = -99999999
                 logits.append(logit)
-            else:
-                logits.append(x_head)
-        
-        # 堆叠所有agent的输出
-        logit = torch.stack(logits, dim=1)  # (B, M, action_dim)
-        return {'logit': logit}
+            return {'logit': torch.stack(logits, dim=1)}  # (B, M, action_dim)
+        elif self.action_space == 'continuous':
+            mus = []
+            sigmas = []
+            for agent_id in range(self.agent_num):
+                agent_obs = agent_state[:, agent_id, :]  # (B, obs_dim)
+                agent_model = self.agent_models[agent_id]
+                x_enc = agent_model['actor'][0](agent_obs)
+                x_head = agent_model['actor'][1](x_enc)  # {'mu': ..., 'sigma': ...}
+                mus.append(x_head['mu'])  # (B, action_dim)
+                sigmas.append(x_head['sigma'])  # (B, action_dim)
+            return {'logit': {'mu': torch.stack(mus, dim=1), 'sigma': torch.stack(sigmas, dim=1)}}
+        elif self.action_space == 'hybrid':
+            # hybrid action space: action_type(discrete) + action_args(continuous)
+            # actor_head 是 ModuleList[actor_action_type, actor_action_args]
+            action_types = []
+            action_args_mus = []
+            action_args_sigmas = []
+            for agent_id in range(self.agent_num):
+                agent_obs = agent_state[:, agent_id, :]  # (B, obs_dim)
+                agent_model = self.agent_models[agent_id]
+                x_enc = agent_model['actor'][0](agent_obs)
+                actor_head = agent_model['actor'][1]  # ModuleList[actor_action_type, actor_action_args]
+                # 分别调用两个head
+                action_type_output = actor_head[0](x_enc)  # {'logit': ...}
+                action_args_output = actor_head[1](x_enc)  # {'mu': ..., 'sigma': ...}
+                action_types.append(action_type_output['logit'])  # (B, action_type_dim)
+                action_args_mus.append(action_args_output['mu'])  # (B, action_args_dim)
+                action_args_sigmas.append(action_args_output['sigma'])  # (B, action_args_dim)
+            return {
+                'logit': {
+                    'action_type': torch.stack(action_types, dim=1),  # (B, M, action_type_dim)
+                    'action_args': {
+                        'mu': torch.stack(action_args_mus, dim=1),  # (B, M, action_args_dim)
+                        'sigma': torch.stack(action_args_sigmas, dim=1)  # (B, M, action_args_dim)
+                    }
+                }
+            }
+        else:
+            raise ValueError(f"Unsupported action_space: {self.action_space}")
     
     def compute_critic(self, x: Dict) -> Dict:
-        """计算critic输出，每个agent使用自己的网络"""
-        global_state = x['global_state']  # shape: (B, M, global_obs_dim)
-        batch_size = global_state.shape[0]
+        """计算critic输出，每个agent使用自己的网络和状态"""
+        # Use agent_state instead of global_state (each agent has different state)
+        agent_state = x['agent_state']  # shape: (B, M, agent_obs_dim)
         
-        # 为每个agent分别计算
+        # 为每个agent分别计算（每个agent使用自己的状态）
         values = []
         for agent_id in range(self.agent_num):
-            agent_global_obs = global_state[:, agent_id, :]  # (B, global_obs_dim)
+            agent_obs = agent_state[:, agent_id, :]  # (B, agent_obs_dim)
             agent_model = self.agent_models[agent_id]
             
-            # 通过critic encoder和head
-            x_enc = agent_model['critic'][0](agent_global_obs)
+            # 通过critic encoder和head（使用agent自己的状态）
+            x_enc = agent_model['critic'][0](agent_obs)
             x_head = agent_model['critic'][1](x_enc)
-            value = x_head['pred']  # (B, 1)
-            values.append(value.squeeze(-1))  # (B,)
+            value = x_head['pred']  # (B, 1) 或 (B,)
+            # 确保 value 是 (B, 1) 形状，以便后续 stack
+            if value.dim() == 1:
+                value = value.unsqueeze(-1)  # (B,) -> (B, 1)
+            elif value.dim() == 0:
+                value = value.unsqueeze(0).unsqueeze(-1)  # scalar -> (1, 1)
+            values.append(value)
         
-        # 堆叠所有agent的输出
-        value = torch.stack(values, dim=1)  # (B, M)
+        # 堆叠所有agent的输出: (B, 1) -> (B, M, 1) -> (B, M)
+        value = torch.stack(values, dim=1).squeeze(-1)  # (B, M)
         return {'value': value}
     
     def compute_actor_critic(self, x: Dict) -> Dict:
