@@ -18,10 +18,10 @@ class BSchannels:
     """Simulator of the downlink channels."""
 
     def __init__(self) -> None:
-        self.h_bs = 5
+        self.h_bs = 5  # 匹配indoor: h_bs=5
         self.h_ms = 1.5
         self.Decorrelation_distance = 25
-        self.bs_position = [[12.5, 12.5]]  # center of the grids
+        self.bs_position = [[12.5, 12.5]]  # 匹配indoor: BS_position=[[12.5, 12.5]] (25x25网格的中心)
         # carrier frequencies in GHz
         self.fc = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6]
 
@@ -56,8 +56,8 @@ class User:
 class Environ:
 
     def __init__(self, n_user: int, n_rb: int) -> None:
-        self.width = 25
-        self.height = 25
+        self.width = 25  # 匹配indoor: width=25
+        self.height = 25  # 匹配indoor: height=25
         self.bs_channels = BSchannels()
         self.users: List[User] = []
         self.demand: List = []
@@ -214,6 +214,8 @@ class Environ:
         interference = cellular_signals.sum(axis=0)
 
         # Compute SINR and Rate per user
+        # NOTE: Matching RA_demo's SINR calculation (without interference in denominator)
+        # RA_demo: cellular_SINR_all = np.divide(cellular_Signals, self.sig2)
         cellular_sinr = np.zeros(self.n_User)
         cellular_rate = np.zeros(self.n_User)
         ee = np.zeros(self.n_User)
@@ -221,14 +223,14 @@ class Environ:
         for i in range(self.n_User):
             rb = channel_sel[i]
             sig = cellular_signals[i, rb]
-            inter = max(interference[rb] - sig, 0.0)
-            denom = noise_power[rb] + inter
-            sinr = sig / denom if denom > 0 else 0.0
+            # Match RA_demo: SINR = Signal / Noise (without interference)
+            sinr = sig / noise_power[rb] if noise_power[rb] > 0 else 0.0
             cellular_sinr[i] = sinr
             rate = np.log2(1.0 + sinr) * self.BW[rb]
             cellular_rate[i] = rate
-            tx_lin = 10 ** (tx_power_db[i] / 10.0)
-            ee[i] = rate / (tx_lin + 0.06)
+            # Match RA_demo: EE = Rate / (10^(power/10 + 0.06))
+            # RA_demo: EE[i] = np.divide(cellular_Rate[i], 10 ** (transmit_power[i, 0] / 10 + 0.06))
+            ee[i] = rate / (10 ** (tx_power_db[i] / 10.0 + 0.06))
 
         # Success metric: no collision on selected RB
         self.success = np.zeros([self.n_User])
@@ -273,6 +275,9 @@ class MultiGeneralEnv(BaseEnv):
     Observation: positions of all users, shape (n_user, 2).
     Action: tensor of shape (n_user, 2) containing [rb_idx, power_db].
     """
+    # Class variable to track global episode count across all instances
+    _global_episode_counter = 0
+    _max_episode = None  # Will be set from config
 
     def __init__(self, cfg: dict) -> None:
         self._cfg = cfg
@@ -281,6 +286,10 @@ class MultiGeneralEnv(BaseEnv):
         self._max_episode_steps = self._cfg.get('max_episode_steps', 200)
         self._agent_obs_only = self._cfg.get('agent_obs_only', False)
         self._agent_specific_global_state = self._cfg.get('agent_specific_global_state', False)
+        
+        # Set max_episode from config (max_train_iter, matching RA_demo's n_episode)
+        if MultiGeneralEnv._max_episode is None:
+            MultiGeneralEnv._max_episode = self._cfg.get('max_train_iter', 1000)
         
         self._env = Environ(
             n_user=self._n_user,
@@ -298,9 +307,10 @@ class MultiGeneralEnv(BaseEnv):
         # Hybrid action space: discrete (rb selection) + continuous (power)
         # action_type: Discrete(n_rb) - 选择资源块 (0 到 n_rb-1)
         # action_args: Box - 选择功率 (连续值)
+        # 模型输出范围是 [-1, 1] (tanh激活)，在 _process_action 中映射到 [0, 24]
         action_type_space = gym.spaces.Discrete(self._n_rb)
-        action_args_low = np.array([float(min(self._env.cellular_power_db_list))], dtype=np.float32)
-        action_args_high = np.array([float(max(self._env.cellular_power_db_list))], dtype=np.float32)
+        action_args_low = np.array([-1.0], dtype=np.float32)  # tanh输出范围
+        action_args_high = np.array([1.0], dtype=np.float32)  # tanh输出范围
         action_args_space = gym.spaces.Box(low=action_args_low, high=action_args_high, dtype=np.float32)
         
         # Hybrid action space for each agent
@@ -335,6 +345,16 @@ class MultiGeneralEnv(BaseEnv):
                 })
             self._init_flag = True
         
+        # Increment global episode counter (matching RA_demo's i_episode)
+        # Note: We increment AFTER the first episode completes, so:
+        # - First episode: counter=0 (time_feature=0/max_episode=0)
+        # - Second episode: counter=1 (time_feature=1/max_episode)
+        # This matches RA_demo where i_episode starts at 0 for the first episode
+        # The counter is incremented here, but the first call to reset() will use counter=0
+        # Subsequent resets will use incremented counter values
+        if self._init_flag:  # Only increment after first initialization
+            MultiGeneralEnv._global_episode_counter += 1
+        
         self._step_counter = 0
         self._env.new_random_game(self._n_user)
         self._cumulative_success.fill(0)  # Reset cumulative success at the beginning of each episode
@@ -343,6 +363,7 @@ class MultiGeneralEnv(BaseEnv):
         return self._get_obs()
 
     def step(self, action: Union[np.ndarray, dict]) -> BaseEnvTimestep:
+        self._env.renew_bs_channels_fastfading()
         self._step_counter += 1
         # process action (support ndarray, dict, or hybrid action format)
         action_arr = self._process_action(action)
@@ -377,16 +398,15 @@ class MultiGeneralEnv(BaseEnv):
         # Divide by n_user to get per-agent return
         if done:
             info = {
-                'eval_episode_return': self._eval_episode_return / (self._n_user*self._max_episode_steps),
+                'eval_episode_return': self._eval_episode_return / self._max_episode_steps,
                 'episode_info': episode_info
             }
+             # update environment for next episode
+            self._env.renew_positions()
+            self._env.renew_bs_channel()
+            self._env.renew_bs_channels_fastfading()
         else:
-            info = {}
-
-        # update environment for next state
-        self._env.renew_positions()
-        self._env.renew_bs_channel()
-        self._env.renew_bs_channels_fastfading()
+            info = {}  
 
         obs = self._get_obs()
         return BaseEnvTimestep(obs, np.array([reward], dtype=np.float32), done, info)
@@ -417,8 +437,12 @@ class MultiGeneralEnv(BaseEnv):
         # This logic is kept from the original snippet. It might need review if n_user > n_rb.
         for i in range(min(n_user, n_rb)):
             user_vector[i] = 1 / n_user
-            
-        time_feature = self._step_counter / self._max_episode_steps
+        
+        # Use global episode progress instead of step progress (matching RA_demo: ind_episode / n_episode)
+        # RA_demo uses: ind_episode / n_episode (global episode progress, 0 to 1)
+        # Previous DI-engine used: step_counter / max_episode_steps (episode step progress, 0 to 1 each episode)
+        # Now using: global_episode_counter / max_episode (global episode progress, 0 to 1)
+        time_feature = MultiGeneralEnv._global_episode_counter / MultiGeneralEnv._max_episode
 
         # Build state for each agent
         agent_states = []
@@ -455,7 +479,7 @@ class MultiGeneralEnv(BaseEnv):
                 # Hybrid action format: {'action_type': (n_user,), 'action_args': (n_user, 1)}
                 action_type = action['action_type']
                 action_args = action['action_args']
-                
+                action_args = np.clip(action_args, -1, 1)
                 # 转换为numpy数组
                 if hasattr(action_type, 'cpu'):
                     action_type = action_type.cpu().numpy()

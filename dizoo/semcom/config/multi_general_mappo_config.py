@@ -2,7 +2,7 @@ from easydict import EasyDict
 
 n_user = 6
 n_rb = 10
-collector_env_num = 1  # 单个环境也可以运行，代码已修复支持 batch_size=1
+collector_env_num = 1  # 使用1个环境：每个transition包含所有agent的数据，1个episode(100步)即可满足每个agent 100个样本
 evaluator_env_num = 1  # 评估时使用单个环境即可
 max_env_step = 1e6
 
@@ -20,11 +20,11 @@ main_config = dict(
         n_user=n_user,
         n_rb=n_rb,
         max_episode_steps=100,
-        agent_obs_only=False,  # Return dict with agent_state only (no global_state)
-        normalize_reward=False,  # Set to True to enable reward normalization
-        collector_env_num=collector_env_num,
-        evaluator_env_num=evaluator_env_num,
-        n_evaluator_episode=evaluator_env_num,
+        max_train_iter=1000,  # 匹配RA_demo的n_episode=1000，用于计算全局episode进度
+        normalize_reward=True,  
+        collector_env_num=1,  # 使用1个环境：每个transition包含所有agent的数据，1个episode(100步)即可满足每个agent 100个样本
+        evaluator_env_num=1,
+        n_evaluator_episode=1,
         stop_value=float('inf'),  # 禁用基于episode return的提前停止，使用termination_checker控制训练时长
         manager=dict(shared_memory=True, ),
     ),
@@ -49,25 +49,26 @@ main_config = dict(
             critic_head_layer_num=1,  # 1 layer for critic head
             norm_type='BN',  # Batch Normalization，匹配TensorFlow实现
             bound_type='tanh',  # mu使用tanh激活，匹配TensorFlow实现
+            sigma_add=0.3,  # Add constant to sigma, matching TensorFlow implementation (default 0.3)
             # Note: type and hidden_size_list are not needed when manually creating MAVACIndependent
         ),
         learn=dict(
             multi_gpu=False,
-            epoch_per_collect=32,
-            batch_size=100,
-            learning_rate=1e-6,  # lr_main = 1e-6
+            epoch_per_collect=32,  # 匹配原始代码的minibatch_steps=32
+            batch_size=512,  # 匹配原始代码的meta_batch_size=512
+            learning_rate=1e-6,  # 匹配原始代码的lr_main=1e-6 
             value_weight=0.5,  # weight_for_L_vf = 0.5
             entropy_weight=0.01,  # weight_for_entropy = 0.01
             clip_ratio=0.5,  # epsilon = 0.5
-            adv_norm=False,
+            adv_norm=True, 
             value_norm=True,
-            ppo_param_init=True,
+            ppo_param_init=False,
             grad_clip_type='clip_norm',
             grad_clip_value=10,
             ignore_done=False,
         ),
         collect=dict(
-            n_sample=100,
+            n_sample=100,  # 匹配原始代码：每个episode收集100个时间步，每个时间步包含所有agent的数据，每个agent有100个样本
             unroll_len=1,
             env_num=collector_env_num,
             # (float) Reward's future discount factor, aka. gamma.
@@ -77,7 +78,7 @@ main_config = dict(
         ),
         eval=dict(
             env_num=evaluator_env_num,
-            evaluator=dict(eval_freq=5, ),  # Evaluate every 5 training iterations
+            evaluator=dict(eval_freq=1, ),  # Evaluate every 5 training iterations
         ),
         other=dict(),
     ),

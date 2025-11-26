@@ -192,22 +192,58 @@ class PPOPolicy(Policy):
                         m.weight.data.copy_(0.01 * m.weight.data)
 
         # Optimizer
-        self._optimizer = Adam(
-            self._model.parameters(),
-            lr=self._cfg.learn.learning_rate,
-            grad_clip_type=self._cfg.learn.grad_clip_type,
-            clip_value=self._cfg.learn.grad_clip_value
-        )
+        # 检查是否是multi-agent模式，需要为每个agent创建独立optimizer（匹配RA_demo）
+        if hasattr(self._model, 'agent_num') and hasattr(self._model, 'agent_models'):
+            # Multi-agent independent模式：为每个agent创建独立optimizer
+            self._multi_agent_optimizers = True
+            self._optimizers = []
+            for agent_id in range(self._model.agent_num):
+                agent_params = []
+                # 收集当前agent的所有参数
+                for agent_model in [self._model.agent_models[agent_id]]:
+                    for module in agent_model.values():
+                        agent_params.extend(list(module.parameters()))
+                
+                optimizer = Adam(
+                    agent_params,
+                    lr=self._cfg.learn.learning_rate,
+                    grad_clip_type=self._cfg.learn.grad_clip_type,
+                    clip_value=self._cfg.learn.grad_clip_value
+                )
+                self._optimizers.append(optimizer)
+            
+            # 保持_optimizer作为第一个agent的optimizer（用于兼容性）
+            self._optimizer = self._optimizers[0]
+        else:
+            # 单agent或共享参数模式：使用原来的单optimizer
+            self._multi_agent_optimizers = False
+            self._optimizer = Adam(
+                self._model.parameters(),
+                lr=self._cfg.learn.learning_rate,
+                grad_clip_type=self._cfg.learn.grad_clip_type,
+                clip_value=self._cfg.learn.grad_clip_value
+            )
 
         # Define linear lr scheduler
         if self._cfg.learn.lr_scheduler is not None:
             epoch_num = self._cfg.learn.lr_scheduler['epoch_num']
             min_lr_lambda = self._cfg.learn.lr_scheduler['min_lr_lambda']
 
-            self._lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-                self._optimizer,
-                lr_lambda=lambda epoch: max(1.0 - epoch * (1.0 - min_lr_lambda) / epoch_num, min_lr_lambda)
-            )
+            if self._multi_agent_optimizers:
+                # 为每个agent创建独立的lr_scheduler
+                self._lr_schedulers = []
+                for optimizer in self._optimizers:
+                    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                        optimizer,
+                        lr_lambda=lambda epoch: max(1.0 - epoch * (1.0 - min_lr_lambda) / epoch_num, min_lr_lambda)
+                    )
+                    self._lr_schedulers.append(lr_scheduler)
+                self._lr_scheduler = self._lr_schedulers[0]  # 兼容性
+            else:
+                self._lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                    self._optimizer,
+                    lr_lambda=lambda epoch: max(1.0 - epoch * (1.0 - min_lr_lambda) / epoch_num, min_lr_lambda)
+                )
 
         self._learn_model = model_wrap(self._model, wrapper_name='base')
 
@@ -317,97 +353,312 @@ class PPOPolicy(Policy):
             for batch in split_data_generator(data, self._cfg.learn.batch_size, shuffle=True):
                 output = self._learn_model.forward(batch['obs'], mode='compute_actor_critic')
                 adv = batch['adv']
-                if self._adv_norm:
-                    # Normalize advantage in a train_batch
-                    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-
-                if self._pretrained_model is not None:
-                    with torch.no_grad():
-                        logit_pretrained = self._pretrained_model.forward(batch['obs'], mode='compute_actor')['logit']
-                else:
-                    logit_pretrained = None
-
-                # Calculate ppo error
-                if self._action_space == 'continuous':
-                    ppo_batch = ppo_data(
-                        output['logit'], batch['logit'], batch['action'], output['value'], batch['value'], adv,
-                        batch['return'], batch['weight'], logit_pretrained
-                    )
-                    ppo_loss, ppo_info = ppo_error_continuous(ppo_batch, self._clip_ratio, kl_type=self._kl_type)
-                elif self._action_space == 'discrete':
-                    ppo_batch = ppo_data(
-                        output['logit'], batch['logit'], batch['action'], output['value'], batch['value'], adv,
-                        batch['return'], batch['weight'], logit_pretrained
-                    )
-                    ppo_loss, ppo_info = ppo_error(ppo_batch, self._clip_ratio, kl_type=self._kl_type)
-                elif self._action_space == 'hybrid':
-                    # Get logit_pretrained for hybrid action space
-                    if self._pretrained_model is not None and logit_pretrained is not None:
-                        # Extract action_type from pretrained logit for hybrid
-                        logit_pretrained_action_type = logit_pretrained.get('action_type', None) if isinstance(logit_pretrained, dict) else None
-                    else:
-                        logit_pretrained_action_type = None
-                    
-                    # discrete part (discrete policy loss and entropy loss)
-                    ppo_discrete_batch = ppo_policy_data(
-                        output['logit']['action_type'], batch['logit']['action_type'], batch['action']['action_type'],
-                        adv, batch['weight'], logit_pretrained_action_type
-                    )
-                    ppo_discrete_loss, ppo_discrete_info = ppo_policy_error(
-                        ppo_discrete_batch, self._clip_ratio, kl_type=self._kl_type
-                    )
-                    # continuous part (continuous policy loss and entropy loss, value loss)
-                    # For continuous part, logit_pretrained should be action_args if available
-                    if self._pretrained_model is not None and logit_pretrained is not None:
-                        logit_pretrained_action_args = logit_pretrained.get('action_args', None) if isinstance(logit_pretrained, dict) else None
-                    else:
-                        logit_pretrained_action_args = None
-                    ppo_continuous_batch = ppo_data(
-                        output['logit']['action_args'], batch['logit']['action_args'], batch['action']['action_args'],
-                        output['value'], batch['value'], adv, batch['return'], batch['weight'], logit_pretrained_action_args
-                    )
-                    ppo_continuous_loss, ppo_continuous_info = ppo_error_continuous(
-                        ppo_continuous_batch, self._clip_ratio, kl_type=self._kl_type
-                    )
-                    # sum discrete and continuous loss
-                    ppo_loss = type(ppo_continuous_loss)(
-                        ppo_continuous_loss.policy_loss + ppo_discrete_loss.policy_loss, ppo_continuous_loss.value_loss,
-                        ppo_continuous_loss.entropy_loss + ppo_discrete_loss.entropy_loss, ppo_continuous_loss.kl_div
-                    )
-                    ppo_info = type(ppo_continuous_info)(
-                        max(ppo_continuous_info.approx_kl, ppo_discrete_info.approx_kl),
-                        max(ppo_continuous_info.clipfrac, ppo_discrete_info.clipfrac)
-                    )
-                wv, we = self._value_weight, self._entropy_weight
-                kl_div = ppo_loss.kl_div
-                total_loss = (
-                    ppo_loss.policy_loss + wv * ppo_loss.value_loss - we * ppo_loss.entropy_loss +
-                    self._kl_beta * kl_div
+                
+                # Check if this is multi-agent independent training (MAVACIndependent model)
+                # Match RA_demo: each agent trains separately with its own samples
+                is_multi_agent_independent = (
+                    self._cfg.multi_agent and 
+                    hasattr(self._learn_model, 'agent_num') and
+                    hasattr(self._learn_model, 'get_agent_models')
                 )
-
-                self._optimizer.zero_grad()
-                total_loss.backward()
-                self._optimizer.step()
-
-                if self._cfg.learn.lr_scheduler is not None:
-                    cur_lr = sum(self._lr_scheduler.get_last_lr()) / len(self._lr_scheduler.get_last_lr())
+                
+                if is_multi_agent_independent:
+                    # Multi-agent independent training: train each agent separately (matching RA_demo)
+                    # In RA_demo: for i in range(n_veh): train agent i with its own 512 samples
+                    agent_num = self._learn_model.agent_num
+                    total_loss = None
+                    return_info = {}
+                    
+                    # Match RA_demo: normalize advantage globally (all agents together)
+                    # RA_demo: gaes = (gaes - gaes.mean()) / (gaes.std())
+                    if self._adv_norm:
+                        if adv.dim() > 1:
+                            # Collect all advantages from all agents
+                            all_adv = adv.flatten()  # Flatten to get all advantages
+                            adv_mean = all_adv.mean()
+                            adv_std = all_adv.std()
+                            # Normalize all advantages using global mean and std
+                            # Match RA_demo 2 exactly: no +1e-8
+                            adv = (adv - adv_mean) / adv_std
+                        else:
+                            # Single agent case
+                            # Match RA_demo 2 exactly: no +1e-8
+                            adv = (adv - adv.mean()) / adv.std()
+                    
+                    for agent_id in range(agent_num):
+                        # Extract data for this agent (matching RA_demo: sampled_inp[0][:, i, :])
+                        agent_obs = {'agent_state': batch['obs']['agent_state'][:, agent_id, :]}  # (B, obs_dim)
+                        agent_action = {}
+                        agent_logit = {}
+                        agent_value = batch['value'][:, agent_id] if batch['value'].dim() > 1 else batch['value']  # (B,)
+                        agent_adv = adv[:, agent_id] if adv.dim() > 1 else adv  # (B,)
+                        agent_return = batch['return'][:, agent_id] if batch['return'].dim() > 1 else batch['return']  # (B,)
+                        
+                        # Extract agent-specific action and logit
+                        if self._action_space == 'hybrid':
+                            # For hybrid action space:
+                            # - batch['action']['action_args'] is a tensor (actual executed action)
+                            # - batch['logit']['action_args'] is a dict with 'mu' and 'sigma' (policy distribution)
+                            agent_action = {
+                                'action_type': batch['action']['action_type'][:, agent_id],
+                                'action_args': batch['action']['action_args'][:, agent_id]
+                            }
+                            # Extract logit: action_type is tensor, action_args is dict with mu and sigma
+                            logit_action_args = batch['logit']['action_args']
+                            if isinstance(logit_action_args, dict):
+                                # action_args is a dict with 'mu' and 'sigma'
+                                agent_logit = {
+                                    'action_type': batch['logit']['action_type'][:, agent_id, :],
+                                    'action_args': {
+                                        'mu': logit_action_args['mu'][:, agent_id, :],
+                                        'sigma': logit_action_args['sigma'][:, agent_id, :]
+                                    }
+                                }
+                            else:
+                                # action_args is a tensor (shouldn't happen for hybrid, but handle it)
+                                agent_logit = {
+                                    'action_type': batch['logit']['action_type'][:, agent_id, :],
+                                    'action_args': logit_action_args[:, agent_id, :]
+                                }
+                        else:
+                            agent_action = batch['action'][:, agent_id] if batch['action'].dim() > 1 else batch['action']
+                            agent_logit = batch['logit'][:, agent_id, :] if batch['logit'].dim() > 2 else batch['logit']
+                        
+                        # Forward pass for this agent
+                        # Need to pass full agent_state shape (B, M, obs_dim) to model, but only use agent_id's output
+                        # Create a dummy full observation with only this agent's data
+                        full_agent_state = batch['obs']['agent_state']  # (B, M, obs_dim)
+                        agent_obs_full = {'agent_state': full_agent_state}
+                        agent_output_full = self._learn_model.forward(agent_obs_full, mode='compute_actor_critic')
+                        # Extract only this agent's output
+                        if self._action_space == 'hybrid':
+                            agent_output = {
+                                'logit': {
+                                    'action_type': agent_output_full['logit']['action_type'][:, agent_id, :],
+                                    'action_args': {
+                                        'mu': agent_output_full['logit']['action_args']['mu'][:, agent_id, :],
+                                        'sigma': agent_output_full['logit']['action_args']['sigma'][:, agent_id, :]
+                                    }
+                                },
+                                'value': agent_output_full['value'][:, agent_id]
+                            }
+                        elif self._action_space == 'continuous':
+                            agent_output = {
+                                'logit': {
+                                    'mu': agent_output_full['logit']['mu'][:, agent_id, :],
+                                    'sigma': agent_output_full['logit']['sigma'][:, agent_id, :]
+                                },
+                                'value': agent_output_full['value'][:, agent_id]
+                            }
+                        else:  # discrete
+                            agent_output = {
+                                'logit': agent_output_full['logit'][:, agent_id, :],
+                                'value': agent_output_full['value'][:, agent_id]
+                            }
+                        
+                        if self._pretrained_model is not None:
+                            with torch.no_grad():
+                                agent_logit_pretrained = self._pretrained_model.forward(agent_obs, mode='compute_actor')['logit']
+                        else:
+                            agent_logit_pretrained = None
+                        
+                        # Calculate ppo error for this agent
+                        if self._action_space == 'continuous':
+                            agent_ppo_batch = ppo_data(
+                                agent_output['logit'], agent_logit, agent_action, agent_output['value'], agent_value, agent_adv,
+                                agent_return, batch.get('weight', None), agent_logit_pretrained
+                            )
+                            agent_ppo_loss, agent_ppo_info = ppo_error_continuous(agent_ppo_batch, self._clip_ratio, kl_type=self._kl_type)
+                        elif self._action_space == 'discrete':
+                            agent_ppo_batch = ppo_data(
+                                agent_output['logit'], agent_logit, agent_action, agent_output['value'], agent_value, agent_adv,
+                                agent_return, batch.get('weight', None), agent_logit_pretrained
+                            )
+                            agent_ppo_loss, agent_ppo_info = ppo_error(agent_ppo_batch, self._clip_ratio, kl_type=self._kl_type)
+                        elif self._action_space == 'hybrid':
+                            # Get logit_pretrained for hybrid action space
+                            if self._pretrained_model is not None and agent_logit_pretrained is not None:
+                                logit_pretrained_action_type = agent_logit_pretrained.get('action_type', None) if isinstance(agent_logit_pretrained, dict) else None
+                            else:
+                                logit_pretrained_action_type = None
+                            
+                            # discrete part
+                            agent_ppo_discrete_batch = ppo_policy_data(
+                                agent_output['logit']['action_type'], agent_logit['action_type'], agent_action['action_type'],
+                                agent_adv, batch.get('weight', None), logit_pretrained_action_type
+                            )
+                            agent_ppo_discrete_loss, agent_ppo_discrete_info = ppo_policy_error(
+                                agent_ppo_discrete_batch, self._clip_ratio, kl_type=self._kl_type
+                            )
+                            # continuous part
+                            if self._pretrained_model is not None and agent_logit_pretrained is not None:
+                                logit_pretrained_action_args = agent_logit_pretrained.get('action_args', None) if isinstance(agent_logit_pretrained, dict) else None
+                            else:
+                                logit_pretrained_action_args = None
+                            agent_ppo_continuous_batch = ppo_data(
+                                agent_output['logit']['action_args'], agent_logit['action_args'], agent_action['action_args'],
+                                agent_output['value'], agent_value, agent_adv, agent_return, batch.get('weight', None), logit_pretrained_action_args
+                            )
+                            agent_ppo_continuous_loss, agent_ppo_continuous_info = ppo_error_continuous(
+                                agent_ppo_continuous_batch, self._clip_ratio, kl_type=self._kl_type
+                            )
+                            # sum discrete and continuous loss
+                            agent_ppo_loss = type(agent_ppo_continuous_loss)(
+                                agent_ppo_continuous_loss.policy_loss + agent_ppo_discrete_loss.policy_loss, 
+                                agent_ppo_continuous_loss.value_loss,
+                                agent_ppo_continuous_loss.entropy_loss + agent_ppo_discrete_loss.entropy_loss, 
+                                agent_ppo_continuous_loss.kl_div
+                            )
+                            agent_ppo_info = type(agent_ppo_continuous_info)(
+                                max(agent_ppo_continuous_info.approx_kl, agent_ppo_discrete_info.approx_kl),
+                                max(agent_ppo_continuous_info.clipfrac, agent_ppo_discrete_info.clipfrac)
+                            )
+                        
+                        # Calculate total loss for this agent
+                        wv, we = self._value_weight, self._entropy_weight
+                        agent_total_loss = (
+                            agent_ppo_loss.policy_loss + wv * agent_ppo_loss.value_loss - we * agent_ppo_loss.entropy_loss
+                        )
+                        
+                        # Match RA_demo 2: each agent updates separately (not accumulated)
+                        # RA_demo 2: for i in range(n_veh): loss = ppoes.train(..., ppoes.sesses[i])
+                        # Use independent optimizer for each agent (if available)
+                        if self._multi_agent_optimizers:
+                            optimizer = self._optimizers[agent_id]
+                        else:
+                            optimizer = self._optimizer
+                        
+                        optimizer.zero_grad()
+                        agent_total_loss.backward()
+                        optimizer.step()
+                        
+                        # Accumulate info for logging
+                        if total_loss is None:
+                            total_loss = agent_total_loss.item()
+                            return_info = {
+                                'policy_loss': agent_ppo_loss.policy_loss.item(),
+                                'value_loss': agent_ppo_loss.value_loss.item(),
+                                'entropy_loss': agent_ppo_loss.entropy_loss.item(),
+                                'approx_kl': agent_ppo_info.approx_kl,
+                                'clipfrac': agent_ppo_info.clipfrac,
+                            }
+                        else:
+                            total_loss += agent_total_loss.item()
+                            return_info['policy_loss'] += agent_ppo_loss.policy_loss.item()
+                            return_info['value_loss'] += agent_ppo_loss.value_loss.item()
+                            return_info['entropy_loss'] += agent_ppo_loss.entropy_loss.item()
+                            return_info['approx_kl'] = max(return_info['approx_kl'], agent_ppo_info.approx_kl)
+                            return_info['clipfrac'] = max(return_info['clipfrac'], agent_ppo_info.clipfrac)
+                    
+                    # Average loss info for logging (but training was done separately for each agent)
+                    total_loss = total_loss / agent_num
+                    return_info['policy_loss'] /= agent_num
+                    return_info['value_loss'] /= agent_num
+                    return_info['entropy_loss'] /= agent_num
+                    
+                    # Add additional info
+                    return_info.update({
+                        'cur_lr': self._optimizer.defaults['lr'] if self._cfg.learn.lr_scheduler is None else sum(self._lr_scheduler.get_last_lr()) / len(self._lr_scheduler.get_last_lr()),
+                        'total_loss': total_loss,  # Already converted to float by .item() above
+                        'adv_max': adv.max().item() if adv.dim() > 1 else adv.max().item(),
+                        'adv_mean': adv.mean().item() if adv.dim() > 1 else adv.mean().item(),
+                        'value_mean': output['value'].mean().item(),
+                        'value_max': output['value'].max().item(),
+                    })
                 else:
-                    cur_lr = self._optimizer.defaults['lr']
+                    # Original single-agent or shared multi-agent training
+                    if self._adv_norm:
+                        # Normalize advantage in a train_batch
+                        # Match RA_demo 2 exactly: no +1e-8
+                        adv = (adv - adv.mean()) / adv.std()
 
-                return_info = {
-                    'cur_lr': cur_lr,
-                    'total_loss': total_loss.item(),
-                    'policy_loss': ppo_loss.policy_loss.item(),
-                    'value_loss': ppo_loss.value_loss.item(),
-                    'entropy_loss': ppo_loss.entropy_loss.item(),
-                    'adv_max': adv.max().item(),
-                    'adv_mean': adv.mean().item(),
-                    'value_mean': output['value'].mean().item(),
-                    'value_max': output['value'].max().item(),
-                    'approx_kl': ppo_info.approx_kl,
-                    'clipfrac': ppo_info.clipfrac,
-                    # 'kl_div': kl_div.item(),
-                }
+                    if self._pretrained_model is not None:
+                        with torch.no_grad():
+                            logit_pretrained = self._pretrained_model.forward(batch['obs'], mode='compute_actor')['logit']
+                    else:
+                        logit_pretrained = None
+
+                    # Calculate ppo error
+                    if self._action_space == 'continuous':
+                        ppo_batch = ppo_data(
+                            output['logit'], batch['logit'], batch['action'], output['value'], batch['value'], adv,
+                            batch['return'], batch['weight'], logit_pretrained
+                        )
+                        ppo_loss, ppo_info = ppo_error_continuous(ppo_batch, self._clip_ratio, kl_type=self._kl_type)
+                    elif self._action_space == 'discrete':
+                        ppo_batch = ppo_data(
+                            output['logit'], batch['logit'], batch['action'], output['value'], batch['value'], adv,
+                            batch['return'], batch['weight'], logit_pretrained
+                        )
+                        ppo_loss, ppo_info = ppo_error(ppo_batch, self._clip_ratio, kl_type=self._kl_type)
+                    elif self._action_space == 'hybrid':
+                        # Get logit_pretrained for hybrid action space
+                        if self._pretrained_model is not None and logit_pretrained is not None:
+                            # Extract action_type from pretrained logit for hybrid
+                            logit_pretrained_action_type = logit_pretrained.get('action_type', None) if isinstance(logit_pretrained, dict) else None
+                        else:
+                            logit_pretrained_action_type = None
+                        
+                        # discrete part (discrete policy loss and entropy loss)
+                        ppo_discrete_batch = ppo_policy_data(
+                            output['logit']['action_type'], batch['logit']['action_type'], batch['action']['action_type'],
+                            adv, batch['weight'], logit_pretrained_action_type
+                        )
+                        ppo_discrete_loss, ppo_discrete_info = ppo_policy_error(
+                            ppo_discrete_batch, self._clip_ratio, kl_type=self._kl_type
+                        )
+                        # continuous part (continuous policy loss and entropy loss, value loss)
+                        # For continuous part, logit_pretrained should be action_args if available
+                        if self._pretrained_model is not None and logit_pretrained is not None:
+                            logit_pretrained_action_args = logit_pretrained.get('action_args', None) if isinstance(logit_pretrained, dict) else None
+                        else:
+                            logit_pretrained_action_args = None
+                        ppo_continuous_batch = ppo_data(
+                            output['logit']['action_args'], batch['logit']['action_args'], batch['action']['action_args'],
+                            output['value'], batch['value'], adv, batch['return'], batch['weight'], logit_pretrained_action_args
+                        )
+                        ppo_continuous_loss, ppo_continuous_info = ppo_error_continuous(
+                            ppo_continuous_batch, self._clip_ratio, kl_type=self._kl_type
+                        )
+                        # sum discrete and continuous loss
+                        ppo_loss = type(ppo_continuous_loss)(
+                            ppo_continuous_loss.policy_loss + ppo_discrete_loss.policy_loss, ppo_continuous_loss.value_loss,
+                            ppo_continuous_loss.entropy_loss + ppo_discrete_loss.entropy_loss, ppo_continuous_loss.kl_div
+                        )
+                        ppo_info = type(ppo_continuous_info)(
+                            max(ppo_continuous_info.approx_kl, ppo_discrete_info.approx_kl),
+                            max(ppo_continuous_info.clipfrac, ppo_discrete_info.clipfrac)
+                        )
+                    wv, we = self._value_weight, self._entropy_weight
+                    kl_div = ppo_loss.kl_div
+                    total_loss = (
+                        ppo_loss.policy_loss + wv * ppo_loss.value_loss - we * ppo_loss.entropy_loss 
+                        # + self._kl_beta * kl_div
+                    )
+
+                    self._optimizer.zero_grad()
+                    total_loss.backward()
+                    self._optimizer.step()
+
+                    if self._cfg.learn.lr_scheduler is not None:
+                        cur_lr = sum(self._lr_scheduler.get_last_lr()) / len(self._lr_scheduler.get_last_lr())
+                    else:
+                        cur_lr = self._optimizer.defaults['lr']
+
+                    return_info = {
+                        'cur_lr': cur_lr,
+                        'total_loss': total_loss.item(),
+                        'policy_loss': ppo_loss.policy_loss.item(),
+                        'value_loss': ppo_loss.value_loss.item(),
+                        'entropy_loss': ppo_loss.entropy_loss.item(),
+                        'adv_max': adv.max().item(),
+                        'adv_mean': adv.mean().item(),
+                        'value_mean': output['value'].mean().item(),
+                        'value_max': output['value'].max().item(),
+                        'approx_kl': ppo_info.approx_kl,
+                        'clipfrac': ppo_info.clipfrac,
+                        # 'kl_div': kl_div.item(),
+                    }
                 if self._action_space == 'continuous':
                     return_info.update(
                         {
@@ -1274,7 +1525,8 @@ class PPOOffPolicy(Policy):
 
             if self._adv_norm:
                 # Normalize advantage in a total train_batch
-                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+                # Match RA_demo 2 exactly: no +1e-8
+                adv = (adv - adv.mean()) / adv.std()
             # Calculate ppo loss
             if self._action_space == 'continuous':
                 ppodata = ppo_data(
@@ -1319,7 +1571,8 @@ class PPOOffPolicy(Policy):
             adv = data['adv']
             if self._adv_norm:
                 # Normalize advantage in a total train_batch
-                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+                # Match original TensorFlow implementation: no +1e-8
+                adv = (adv - adv.mean()) / (adv.std())
 
             # Calculate ppo loss
             if self._action_space == 'continuous':
@@ -1842,7 +2095,8 @@ class PPOSTDIMPolicy(PPOPolicy):
                 adv = batch['adv']
                 if self._adv_norm:
                     # Normalize advantage in a train_batch
-                    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+                    # Match original TensorFlow implementation: no +1e-8
+                    adv = (adv - adv.mean()) / (adv.std())
 
                 # Calculate ppo loss
                 if self._action_space == 'continuous':

@@ -506,15 +506,40 @@ def split_data_generator(data: dict, split_size: int, shuffle: bool = True) -> d
     # if continuous action, data['logit'] is list of length 2
     length = length[0]
     assert split_size >= 1
-    if shuffle:
-        indices = np.random.permutation(length)
-    else:
-        indices = np.arange(length)
-    for i in range(0, length, split_size):
-        if i + split_size > length:
-            i = length - split_size
-        batch = split_fn(data, indices, i, i + split_size)
+    
+    if split_size > length:
+        # Generate random indices with replacement (exactly matching RA_demo: np.random.randint(low=0, high=length, size=batch_size))
+        sample_indices = np.random.randint(low=0, high=length, size=split_size)
+        if shuffle:
+            # Shuffle the sampled indices to ensure randomness across epochs
+            np.random.shuffle(sample_indices)
+        
+        # Create a custom split function for sampling with replacement
+        def sample_fn(data, indices):
+            if data is None:
+                return None
+            elif isinstance(data, list):
+                return [sample_fn(d, indices) for d in data]
+            elif isinstance(data, dict):
+                return {k1: sample_fn(v1, indices) for k1, v1 in data.items()}
+            elif isinstance(data, str):
+                return data
+            else:
+                return data[indices]
+        
+        batch = sample_fn(data, sample_indices)
         yield batch
+    else:
+        # Original behavior: split without replacement
+        if shuffle:
+            indices = np.random.permutation(length)
+        else:
+            indices = np.arange(length)
+        for i in range(0, length, split_size):
+            if i + split_size > length:
+                i = length - split_size
+            batch = split_fn(data, indices, i, i + split_size)
+            yield batch
 
 
 class RunningMeanStd(object):

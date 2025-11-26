@@ -43,6 +43,7 @@ class MAVACIndependent(nn.Module):
         bound_type: Optional[str] = None,
         encoder: Optional[Tuple[torch.nn.Module, torch.nn.Module]] = None,
         encoder_hidden_size_list: Optional[SequenceType] = None,  # For 3-layer shared encoder (512->256->128)
+        sigma_add: Optional[float] = 0.0,  # Add constant to sigma, matching TensorFlow implementation
     ) -> None:
         """
         Overview:
@@ -80,6 +81,7 @@ class MAVACIndependent(nn.Module):
         self.action_shape = action_shape
         self.agent_num = agent_num
         self.action_space = action_space
+        self.sigma_add = sigma_add  # Store sigma_add for later use
         
         # 为每个agent创建独立的网络
         self.agent_models = nn.ModuleList()
@@ -113,7 +115,9 @@ class MAVACIndependent(nn.Module):
             else:
                 return None
         
-        for agent_id in range(agent_num):
+        # 为了确保所有agent的网络参数完全相同（匹配RA_demo的行为），
+        # 先创建一个agent的网络，然后复制参数给其他agent
+        def create_agent_network():
             # 为每个agent创建独立的encoder和head
             if encoder:
                 actor_encoder, critic_encoder = encoder
@@ -122,17 +126,28 @@ class MAVACIndependent(nn.Module):
                 critic_enc = self._clone_module(critic_encoder)
             else:
                 if encoder_hidden_size_list:
-                    # 共享编码器：obs -> 512 -> 256 (前两层)
-                    # Actor分支：从256维输出 (mu, sigma, RB)
-                    # Critic分支：256 -> 128 -> v (在RegressionHead中处理)
-                    shared_hidden_list = encoder_hidden_size_list[:2]  # [512, 256]
-                    shared_encoder = new_encoder(shared_hidden_list, activation, norm_type)
+                    # 共享编码器：obs -> 512 -> 256 -> 128 (完整3层，匹配原始TensorFlow实现)
+                    # 所有层共享参数，Actor从256维（layer_2_b）开始，Critic从128维（layer_3_b）开始
+                    shared_encoder = new_encoder(encoder_hidden_size_list, activation, norm_type)  # 完整3层
                     
-                    # Actor encoder: 直接使用共享编码器（到256维）
-                    actor_enc = shared_encoder
+                    # Actor encoder: 使用共享编码器的前两层（到256维）
+                    # 创建一个wrapper，只使用共享编码器的前两层
+                    class ActorEncoderWrapper(nn.Module):
+                        def __init__(self, shared_encoder, num_layers=2):
+                            super().__init__()
+                            self.shared_encoder = shared_encoder
+                            self.num_layers = num_layers
+                        
+                        def forward(self, x):
+                            # 只使用前num_layers层
+                            for i in range(self.num_layers):
+                                x = self.shared_encoder[i](x)
+                            return x
                     
-                    # Critic encoder: 也使用共享编码器（到256维），256->128在RegressionHead中处理
-                    critic_enc = shared_encoder
+                    actor_enc = ActorEncoderWrapper(shared_encoder, num_layers=2)  # 前两层
+                    
+                    # Critic encoder: 使用完整的共享编码器（到128维），匹配原始代码的layer_3_b
+                    critic_enc = shared_encoder  # 完整3层
                 else:
                     # 默认单层结构（不共享）
                     actor_enc = nn.Sequential(
@@ -146,18 +161,23 @@ class MAVACIndependent(nn.Module):
                     )
             
             # 创建head
-            # Critic head: 如果使用共享编码器，输入256维，通过hidden_size=128添加256->128层
+            # Critic head: 如果使用共享编码器，从128维直接到1维（单层），匹配原始代码
             if encoder_hidden_size_list:
-                critic_head_input_size = encoder_hidden_size_list[1]  # 256
-                critic_head_hidden_size_param = encoder_hidden_size_list[2]  # 128
+                critic_head_input_size = encoder_hidden_size_list[2]  # 128 (从第3层开始)
+                # 单层结构：128 -> 1，匹配原始代码的 Linear(128->1)
+                # 使用layer_num=0创建简单的Linear层（RegressionHead内部会处理）
+                critic_head = RegressionHead(
+                    critic_head_input_size, 1, layer_num=0,  # 单层：128 -> 1 (Linear only)
+                    hidden_size=None,  # 不使用中间层
+                    activation=None,  # 不使用激活（会在compute_critic中应用ReLU）
+                    norm_type=None  # 不使用归一化
+                )
             else:
-                critic_head_input_size = critic_head_hidden_size
-                critic_head_hidden_size_param = critic_head_hidden_size
-            critic_head = RegressionHead(
-                critic_head_input_size, 1, critic_head_layer_num,
-                hidden_size=critic_head_hidden_size_param,  # 256 -> 128 -> 1
-                activation=activation, norm_type=norm_type
-            )
+                critic_head = RegressionHead(
+                    critic_head_hidden_size, 1, critic_head_layer_num,
+                    hidden_size=critic_head_hidden_size,
+                    activation=activation, norm_type=norm_type
+                )
             
             if action_space == 'discrete':
                 actor_head = DiscreteHead(
@@ -208,6 +228,17 @@ class MAVACIndependent(nn.Module):
                 'actor': agent_actor,
                 'critic': agent_critic
             })
+            return agent_model
+        
+        # 创建第一个agent的网络（使用随机种子初始化）
+        first_agent_model = create_agent_network()
+        self.agent_models.append(first_agent_model)
+        
+        # 为其他agent创建网络：直接克隆第一个agent的网络（确保所有agent参数完全相同，且不消耗额外随机数状态）
+        import copy
+        for agent_id in range(1, agent_num):
+            # 直接深拷贝第一个agent的网络，避免创建新网络时消耗随机数状态
+            agent_model = copy.deepcopy(first_agent_model)
             self.agent_models.append(agent_model)
         
         # 为了兼容性，保留actor和critic属性（指向第一个agent的网络）
@@ -260,8 +291,10 @@ class MAVACIndependent(nn.Module):
                 agent_model = self.agent_models[agent_id]
                 x_enc = agent_model['actor'][0](agent_obs)
                 x_head = agent_model['actor'][1](x_enc)  # {'mu': ..., 'sigma': ...}
+                # Apply sigma_add, matching TensorFlow: sigma = sigma + sigma_add
+                sigma = x_head['sigma'] + self.sigma_add
                 mus.append(x_head['mu'])  # (B, action_dim)
-                sigmas.append(x_head['sigma'])  # (B, action_dim)
+                sigmas.append(sigma)  # (B, action_dim)
             return {'logit': {'mu': torch.stack(mus, dim=1), 'sigma': torch.stack(sigmas, dim=1)}}
         elif self.action_space == 'hybrid':
             # hybrid action space: action_type(discrete) + action_args(continuous)
@@ -277,9 +310,11 @@ class MAVACIndependent(nn.Module):
                 # 分别调用两个head
                 action_type_output = actor_head[0](x_enc)  # {'logit': ...}
                 action_args_output = actor_head[1](x_enc)  # {'mu': ..., 'sigma': ...}
+                # Apply sigma_add, matching TensorFlow: sigma = sigma + sigma_add
+                action_args_sigma = action_args_output['sigma'] + self.sigma_add
                 action_types.append(action_type_output['logit'])  # (B, action_type_dim)
                 action_args_mus.append(action_args_output['mu'])  # (B, action_args_dim)
-                action_args_sigmas.append(action_args_output['sigma'])  # (B, action_args_dim)
+                action_args_sigmas.append(action_args_sigma)  # (B, action_args_dim)
             return {
                 'logit': {
                     'action_type': torch.stack(action_types, dim=1),  # (B, M, action_type_dim)
@@ -307,6 +342,8 @@ class MAVACIndependent(nn.Module):
             x_enc = agent_model['critic'][0](agent_obs)
             x_head = agent_model['critic'][1](x_enc)
             value = x_head['pred']  # (B, 1) 或 (B,)
+            # 应用ReLU激活函数，匹配原始TensorFlow代码: v = ReLU(layer_3_b @ w_v + b_v)
+            value = torch.relu(value)
             # 确保 value 是 (B, 1) 形状，以便后续 stack
             if value.dim() == 1:
                 value = value.unsqueeze(-1)  # (B,) -> (B, 1)
